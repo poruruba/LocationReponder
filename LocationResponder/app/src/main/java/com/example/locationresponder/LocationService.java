@@ -134,21 +134,15 @@ public class LocationService extends Service implements UIHandler.Callback {
         context = getApplicationContext();
         handler = new UIHandler(this);
 
+        audioManager = (AudioManager)getSystemService(Context.AUDIO_SERVICE);
+        if( audioManager == null ) {
+            Log.e(MainActivity.TAG, "AudioManager not available");
+        }
         tts = new TextToSpeech(this, new TextToSpeech.OnInitListener() {
             @Override
             public void onInit(int status) {
                 if( status == TextToSpeech.SUCCESS ) {
-                    audioManager = (AudioManager)getSystemService(Context.AUDIO_SERVICE);
-                    AudioAttributes attributes = new AudioAttributes.Builder()
-                            .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
-                            .build();
-                    // ときどきフォーカス取得が遅れるので、setOnAudioFocusChangeListener() を使うのが望ましい
-                    mFocusRequest = new AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT)
-                            .setAudioAttributes(attributes)
-                            .build();
-
-                    tts.setOnUtteranceProgressListener(mTtsListener);
-
+                    initializeTts();
                     isTtsReady = true;
                 }else{
                     Log.d(MainActivity.TAG, "TextToSpeech init error");
@@ -285,7 +279,7 @@ public class LocationService extends Service implements UIHandler.Callback {
         }
     };
 
-    void changeNotificationTitle(String title){
+    private void changeNotificationTitle(String title){
         Notification notification = new Notification.Builder(context, CHANNEL_ID)
                 .setContentTitle(title)
                 .setSmallIcon(android.R.drawable.ic_menu_mylocation)
@@ -540,6 +534,10 @@ public class LocationService extends Service implements UIHandler.Callback {
                 queue.sendPacketStart(json2bin(result_json));
                 break;
             }
+            default:{
+                Log.e(MainActivity.TAG, "Not supported cmd: " + g_cmd);
+                break;
+            }
         }
     }
 
@@ -555,46 +553,60 @@ public class LocationService extends Service implements UIHandler.Callback {
         tts.speak(message, TextToSpeech.QUEUE_ADD, null, TextToSpeech.Engine.KEY_PARAM_UTTERANCE_ID );
     }
 
-    private final UtteranceProgressListener mTtsListener = new UtteranceProgressListener() {
-        @Override
-        public void onStart(String utteranceId) {
-            Log.d(MainActivity.TAG,"progress on Start " + utteranceId);
-        }
+    void initializeTts(){
+        Log.d(MainActivity.TAG, "initializeTts");
 
-        @Override
-        public void onDone(String utteranceId) {
-            Log.d(MainActivity.TAG,"progress on Done " + utteranceId);
-            if( audioManager != null )
-                audioManager.abandonAudioFocusRequest(mFocusRequest);
+        AudioAttributes attributes = new AudioAttributes.Builder()
+                .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                .build();
+        // ときどきフォーカス取得が遅れるので、setOnAudioFocusChangeListener() を使うのが望ましい
+        mFocusRequest = new AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT)
+                .setAudioAttributes(attributes)
+                .build();
 
-            try {
-                JSONObject result_json = new JSONObject();
-                result_json.put("rsp", CMD_SPEECH);
-                result_json.put("txid", g_txid);
-                result_json.put("status", STATUS_OK);
-                queue.sendPacketStart(json2bin(result_json));
-            }catch(Exception ex){
-                Log.e(MainActivity.TAG, ex.getMessage());
+        UtteranceProgressListener ttsListener = new UtteranceProgressListener() {
+            @Override
+            public void onStart(String utteranceId) {
+                Log.d(MainActivity.TAG,"progress on Start " + utteranceId);
             }
-        }
 
-        @Override
-        public void onError(String utteranceId) {
-            Log.d(MainActivity.TAG,"progress on Error " + utteranceId);
-            if( audioManager != null )
-                audioManager.abandonAudioFocusRequest(mFocusRequest);
+            @Override
+            public void onDone(String utteranceId) {
+                Log.d(MainActivity.TAG,"progress on Done " + utteranceId);
+                if( audioManager != null )
+                    audioManager.abandonAudioFocusRequest(mFocusRequest);
 
-            try {
-                JSONObject result_json = new JSONObject();
-                result_json.put("rsp", CMD_SPEECH);
-                result_json.put("txid", g_txid);
-                result_json.put("status", STATUS_ERROR);
-                queue.sendPacketStart(json2bin(result_json));
-            }catch(Exception ex){
-                Log.e(MainActivity.TAG, ex.getMessage());
+                try {
+                    JSONObject result_json = new JSONObject();
+                    result_json.put("rsp", CMD_SPEECH);
+                    result_json.put("txid", g_txid);
+                    result_json.put("status", STATUS_OK);
+                    queue.sendPacketStart(json2bin(result_json));
+                }catch(Exception ex){
+                    Log.e(MainActivity.TAG, ex.getMessage());
+                }
             }
-        }
-    };
+
+            @Override
+            public void onError(String utteranceId) {
+                Log.d(MainActivity.TAG,"progress on Error " + utteranceId);
+                if( audioManager != null )
+                    audioManager.abandonAudioFocusRequest(mFocusRequest);
+
+                try {
+                    JSONObject result_json = new JSONObject();
+                    result_json.put("rsp", CMD_SPEECH);
+                    result_json.put("txid", g_txid);
+                    result_json.put("status", STATUS_ERROR);
+                    queue.sendPacketStart(json2bin(result_json));
+                }catch(Exception ex){
+                    Log.e(MainActivity.TAG, ex.getMessage());
+                }
+            }
+        };
+
+        tts.setOnUtteranceProgressListener(ttsListener);
+    }
 
     private void startRecognizer() {
         Log.d(MainActivity.TAG, "startRecognizer" );
@@ -703,6 +715,7 @@ public class LocationService extends Service implements UIHandler.Callback {
             @Override
             public void onLocationChanged(Location location) {
                 Log.d(MainActivity.TAG, "onLocationChanged");
+                
                 LocationService.this.location = location;
             }
 
