@@ -8,6 +8,7 @@ public class UIHandler extends Handler{
     public static final int MSG_ID_INT =  0x0001;
     public static final int MSG_ID_BARRAY =  0x0002;
     public static final int MSG_ID_NONE =  0x0003;
+    public static final int MSG_ID_OBJECT =  0x0004;
     public static final int MSG_ID_PRC_BASE = 0x0100;
     public static final int MSG_ID_OBJ_BASE = 0x0100;
 
