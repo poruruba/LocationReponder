@@ -25,6 +25,8 @@ import android.location.LocationManager;
 import android.media.AudioAttributes;
 import android.media.AudioFocusRequest;
 import android.media.AudioManager;
+import android.media.MediaDataSource;
+import android.media.MediaPlayer;
 import android.net.Uri;
 import android.os.Binder;
 import android.os.Bundle;
@@ -37,6 +39,7 @@ import android.speech.RecognitionListener;
 import android.speech.RecognizerIntent;
 import android.speech.SpeechRecognizer;
 import android.speech.tts.TextToSpeech;
+import android.util.Base64;
 import android.util.Log;
 import android.app.Activity;
 import android.app.NotificationChannel;
@@ -47,6 +50,7 @@ import android.bluetooth.BluetoothProfile;
 import android.bluetooth.BluetoothGattDescriptor;
 import android.widget.Toast;
 import org.json.JSONObject;
+import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
@@ -59,6 +63,7 @@ public class LocationService extends Service implements UIHandler.Callback {
     static final int NOTIFICATION_ID2 = 2;
     static final int UIMSG_TOAST = 2001;
     static final int UIMSG_RECOGNIZE = 2002;
+    static final int UIMSG_ASSISTANT = 2003;
     static final int MinTime = 5000; // millis
     static final float MinDistance = 10; // meters
     static final UUID serviceUuid = UUID.fromString("08030900-7d3b-4ebf-94e9-18abc4cebede");
@@ -80,6 +85,7 @@ public class LocationService extends Service implements UIHandler.Callback {
     public static final int CMD_TOAST = 0x06;
     public static final int CMD_RECOGNIZE = 0x07;
     public static final int CMD_BROWSER = 0x08;
+    public static final int CMD_ASSISTANT = 0x09;
 
     Context context;
 
@@ -208,6 +214,44 @@ public class LocationService extends Service implements UIHandler.Callback {
         }
     }
 
+    class AssistantResponse{
+        public String text;
+        public byte[] audio;
+
+        public AssistantResponse(String text, byte[] audio){
+            this.text = text;
+            this.audio = audio;
+        }
+    }
+
+    class ByteArrayMediaDataSource extends MediaDataSource {
+        byte[] data;
+
+        public ByteArrayMediaDataSource(byte[] data) {
+            this.data = data;
+        }
+
+        @Override
+        public int readAt(long position, byte[] buffer, int offset, int size) throws IOException {
+            int length = data.length;
+            if (position >= length)
+                return -1;
+            if (position + size > length)
+                size -= (position + size) - length;
+
+            System.arraycopy(data, (int) position, buffer, offset, size);
+            return size;
+        }
+
+        @Override
+        public long getSize() throws IOException {
+            return data.length;
+        }
+
+        @Override
+        public void close() throws IOException {}
+    }
+
     @Override
     public boolean handleMessage(Message message) {
         switch (message.what) {
@@ -222,6 +266,39 @@ public class LocationService extends Service implements UIHandler.Callback {
                     startRecognizer();
                 }
                 break;
+            }
+            case UIHandler.MSG_ID_OBJECT:{
+                if( message.arg1 == UIMSG_ASSISTANT ){
+                    try {
+                        if( audioManager != null )
+                            audioManager.requestAudioFocus( mFocusRequest );
+
+                        AssistantResponse resp = (AssistantResponse)message.obj;
+
+                        final MediaPlayer mp = new MediaPlayer();
+                        mp.setDataSource(new ByteArrayMediaDataSource(resp.audio));
+                        mp.prepare();
+                        mp.setOnErrorListener(new MediaPlayer.OnErrorListener() {
+                            @Override
+                            public boolean onError(MediaPlayer mediaPlayer, int what, int extra) {
+                                Log.e(MainActivity.TAG, "onError");
+                                return false;
+                            }
+                        });
+                        mp.setOnCompletionListener(new MediaPlayer.OnCompletionListener() {
+                            @Override
+                            public void onCompletion(MediaPlayer mediaPlayer) {
+                                mp.stop();
+                                mp.release();
+                                if( audioManager != null )
+                                    audioManager.abandonAudioFocusRequest( mFocusRequest );
+                            }
+                        });
+                        mp.start();
+                    }catch(Exception ex){
+                        Log.e(MainActivity.TAG, ex.getMessage());
+                    }
+                }
             }
         }
         return false;
@@ -355,7 +432,6 @@ public class LocationService extends Service implements UIHandler.Callback {
             if( characteristic.getUuid().compareTo(sendUuid) == 0)
                 queue.sendPacketNext();
         }
-
 /*
         @Override
         public void onCharacteristicRead(BluetoothGatt gatt, BluetoothGattCharacteristic characteristic, int status) {
@@ -391,152 +467,210 @@ public class LocationService extends Service implements UIHandler.Callback {
         }
     }
 
-    private void processPacket(final JSONObject json) throws Exception{
-        g_cmd = json.getInt("cmd");
-        g_txid = ( json.has("txid") ) ? json.getInt("txid") : 0;
-        Log.d(MainActivity.TAG, "processPacket:" + g_cmd);
+    private void processPacket(final JSONObject json){
+        try {
+            g_cmd = json.getInt("cmd");
+            g_txid = (json.has("txid")) ? json.getInt("txid") : 0;
+            Log.d(MainActivity.TAG, "processPacket:" + g_cmd);
 
-        if( queue.isProgress )
-            return;
+            if (queue.isProgress)
+                return;
 
-        if( !isEnable ){
-            JSONObject result_json = new JSONObject();
-            result_json.put("rsp", g_cmd);
-            result_json.put("txid", g_txid);
-            result_json.put("status", STATUS_DISABLED);
-            queue.sendPacketStart(json2bin(result_json));
+            if (!isEnable) {
+                JSONObject result_json = new JSONObject();
+                result_json.put("rsp", g_cmd);
+                result_json.put("txid", g_txid);
+                result_json.put("status", STATUS_DISABLED);
+                queue.sendPacketStart(json2bin(result_json));
 
+                return;
+            }
+        }catch(Exception ex){
+            Log.e(MainActivity.TAG, ex.getMessage());
             return;
         }
 
-        switch( g_cmd ){
-            case CMD_BROWSER: {
-                String url = json.getString("url");
-                Uri uri = Uri.parse(url);
-                Intent intent = new Intent(Intent.ACTION_VIEW, uri);
-                intent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
-                startActivity(intent);
-                break;
-            }
-            case CMD_RECOGNIZE: {
-                handler.sendUIMessage(UIHandler.MSG_ID_NONE, UIMSG_RECOGNIZE, null);
+        try {
+            switch (g_cmd) {
+                case CMD_BROWSER: {
+                    String url = json.getString("url");
+                    Uri uri = Uri.parse(url);
+                    Intent intent = new Intent(Intent.ACTION_VIEW, uri);
+                    intent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                    startActivity(intent);
 
-                break;
-            }
-            case CMD_LOCATION:{
-                JSONObject result_json = new JSONObject();
-                result_json.put("rsp", g_cmd);
-                result_json.put("txid", g_txid);
-                if( location != null ) {
-                    float speed = location.getSpeed() * 3.6f;
+                    JSONObject result_json = new JSONObject();
+                    result_json.put("rsp", CMD_SPEECH);
+                    result_json.put("txid", g_txid);
                     result_json.put("status", STATUS_OK);
-                    result_json.put("latitude", location.getLatitude());
-                    result_json.put("longitude", location.getLongitude());
-                    result_json.put("speed", speed);
-                    if( json.has("latitude") && json.has("longitude") ){
-                        double base_latitude = json.getDouble("latitude");
-                        double base_longitude = json.getDouble("longitude");
-                        float[] distances = new float[3];
-                        Location.distanceBetween(location.getLatitude(), location.getLongitude(), base_latitude, base_longitude, distances);
-                        result_json.put("distance", distances[0]);
-                        result_json.put("direction", distances[1]);
-                    }else if( targetLocation != null ){
-                        float[] distances = new float[3];
-                        Location.distanceBetween(location.getLatitude(), location.getLongitude(), targetLocation.getLatitude(), targetLocation.getLongitude(), distances);
-                        result_json.put("distance", distances[0]);
-                        result_json.put("direction", distances[1]);
-                    }
-                }else{
-                    result_json.put("status", STATUS_ERROR);
+                    queue.sendPacketStart(json2bin(result_json));
+                    break;
                 }
-                queue.sendPacketStart(json2bin(result_json));
-                break;
-            }
-            case CMD_SPEECH: {
-                String message = json.getString("message");
-                speechTts(message);
+                case CMD_RECOGNIZE: {
+                    handler.sendUIMessage(UIHandler.MSG_ID_NONE, UIMSG_RECOGNIZE, null);
+                    break;
+                }
+                case CMD_LOCATION: {
+                    JSONObject result_json = new JSONObject();
+                    result_json.put("rsp", g_cmd);
+                    result_json.put("txid", g_txid);
+                    if (location != null) {
+                        float speed = location.getSpeed() * 3.6f;
+                        result_json.put("status", STATUS_OK);
+                        result_json.put("latitude", location.getLatitude());
+                        result_json.put("longitude", location.getLongitude());
+                        result_json.put("speed", speed);
+                        if (json.has("latitude") && json.has("longitude")) {
+                            double base_latitude = json.getDouble("latitude");
+                            double base_longitude = json.getDouble("longitude");
+                            float[] distances = new float[3];
+                            Location.distanceBetween(location.getLatitude(), location.getLongitude(), base_latitude, base_longitude, distances);
+                            result_json.put("distance", distances[0]);
+                            result_json.put("direction", distances[1]);
+                        } else if (targetLocation != null) {
+                            float[] distances = new float[3];
+                            Location.distanceBetween(location.getLatitude(), location.getLongitude(), targetLocation.getLatitude(), targetLocation.getLongitude(), distances);
+                            result_json.put("distance", distances[0]);
+                            result_json.put("direction", distances[1]);
+                        }
+                    } else {
+                        result_json.put("status", STATUS_ERROR);
+                    }
+                    queue.sendPacketStart(json2bin(result_json));
+                    break;
+                }
+                case CMD_SPEECH: {
+                    String message = json.getString("message");
+                    speechTts(message);
 
-                break;
-            }
-            case CMD_TOAST: {
-                String message = json.getString("message");
-                handler.sendUIMessage(UIHandler.MSG_ID_TEXT, UIMSG_TOAST, message);
+                    JSONObject result_json = new JSONObject();
+                    result_json.put("rsp", CMD_SPEECH);
+                    result_json.put("txid", g_txid);
+                    result_json.put("status", STATUS_OK);
+                    queue.sendPacketStart(json2bin(result_json));
+                    break;
+                }
+                case CMD_TOAST: {
+                    String message = json.getString("message");
+                    handler.sendUIMessage(UIHandler.MSG_ID_TEXT, UIMSG_TOAST, message);
 
-                JSONObject result_json = new JSONObject();
-                result_json.put("rsp", g_cmd);
-                result_json.put("txid", g_txid);
-                result_json.put("status", STATUS_OK);
-                queue.sendPacketStart(json2bin(result_json));
-                break;
-            }
-            case CMD_NOTIFICATION: {
-                String message = json.getString("message");
+                    JSONObject result_json = new JSONObject();
+                    result_json.put("rsp", g_cmd);
+                    result_json.put("txid", g_txid);
+                    result_json.put("status", STATUS_OK);
+                    queue.sendPacketStart(json2bin(result_json));
+                    break;
+                }
+                case CMD_NOTIFICATION: {
+                    String message = json.getString("message");
 
-                Intent notifyIntent = new Intent(this, MainActivity.class);
-                notifyIntent.putExtra("clipboard", message);
-                notifyIntent.setFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP);
-                PendingIntent pendingIntent = PendingIntent.getActivity(this, 0, notifyIntent, PendingIntent.FLAG_UPDATE_CURRENT );
+                    Intent notifyIntent = new Intent(this, MainActivity.class);
+                    notifyIntent.putExtra("clipboard", message);
+                    notifyIntent.setFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP);
+                    PendingIntent pendingIntent = PendingIntent.getActivity(this, 0, notifyIntent, PendingIntent.FLAG_UPDATE_CURRENT);
 
-                Notification notification = new Notification.Builder(this, CHANNEL_ID)
-                        .setContentTitle(message)
-                        .setSmallIcon(android.R.drawable.ic_lock_idle_alarm)
-                        .setAutoCancel(true)
-                        .setContentIntent(pendingIntent)
-                        .setWhen(System.currentTimeMillis())
-                        .setContentIntent(pendingIntent)
-                        .build();
-                notificationManager.notify(NOTIFICATION_ID2, notification);
+                    Notification notification = new Notification.Builder(this, CHANNEL_ID)
+                            .setContentTitle(message)
+                            .setSmallIcon(android.R.drawable.ic_lock_idle_alarm)
+                            .setAutoCancel(true)
+                            .setContentIntent(pendingIntent)
+                            .setWhen(System.currentTimeMillis())
+                            .setContentIntent(pendingIntent)
+                            .build();
+                    notificationManager.notify(NOTIFICATION_ID2, notification);
 
-                JSONObject result_json = new JSONObject();
-                result_json.put("rsp", g_cmd);
-                result_json.put("txid", g_txid);
-                result_json.put("status", STATUS_OK);
-                queue.sendPacketStart(json2bin(result_json));
+                    JSONObject result_json = new JSONObject();
+                    result_json.put("rsp", g_cmd);
+                    result_json.put("txid", g_txid);
+                    result_json.put("status", STATUS_OK);
+                    queue.sendPacketStart(json2bin(result_json));
 
-                break;
-            }
-            case CMD_HTTP_POST: {
-                new Thread(new Runnable() {
-                    @Override
-                    public void run() {
-                        try {
-                            JSONObject response = HttpPostJson.doPost(json.getString("url"), json.getJSONObject("request"), DEFAULT_CONN_TIMEOUT);
-
-                            JSONObject result_json = new JSONObject();
-                            result_json.put("rsp", g_cmd);
-                            result_json.put("txid", g_txid);
-                            result_json.put("response", response );
-                            queue.sendPacketStart(json2bin(result_json));
-                        }catch(Exception ex){
-                            Log.e(MainActivity.TAG, ex.getMessage());
+                    break;
+                }
+                case CMD_HTTP_POST: {
+                    new Thread(new Runnable() {
+                        @Override
+                        public void run() {
                             try {
+                                JSONObject response = HttpPostJson.doPost(json.getString("url"), json.getJSONObject("request"), DEFAULT_CONN_TIMEOUT);
+
                                 JSONObject result_json = new JSONObject();
                                 result_json.put("rsp", g_cmd);
                                 result_json.put("txid", g_txid);
-                                result_json.put("status", STATUS_ERROR);
+                                result_json.put("response", response);
                                 queue.sendPacketStart(json2bin(result_json));
-                            }catch(Exception ex2){
-                                Log.e(MainActivity.TAG, ex2.getMessage());
+                            } catch (Exception ex) {
+                                Log.e(MainActivity.TAG, ex.getMessage());
+                                try {
+                                    JSONObject result_json = new JSONObject();
+                                    result_json.put("rsp", g_cmd);
+                                    result_json.put("txid", g_txid);
+                                    result_json.put("status", STATUS_ERROR);
+                                    queue.sendPacketStart(json2bin(result_json));
+                                } catch (Exception ex2) {
+                                    Log.e(MainActivity.TAG, ex2.getMessage());
+                                }
                             }
                         }
-                    }
-                }).start();
-                break;
-            }
-            case CMD_VIBRATOR: {
-                int msec = ( json.has("duration") ) ? json.getInt("duration") : 500;
-                vibrator.vibrate(VibrationEffect.createOneShot(msec, VibrationEffect.DEFAULT_AMPLITUDE));
+                    }).start();
+                    break;
+                }
+                case CMD_ASSISTANT: {
+                    new Thread(new Runnable() {
+                        @Override
+                        public void run() {
+                            try {
+                                JSONObject response = HttpPostJson.doPost(json.getString("url"), json.getJSONObject("request"), DEFAULT_CONN_TIMEOUT);
+                                if (response.has("audio")) {
+                                    String text = response.getString("text");
+                                    byte[] audio = Base64.decode(response.getString("audio"), 0);
+                                    handler.sendUIMessage(UIHandler.MSG_ID_OBJECT, UIMSG_ASSISTANT, new AssistantResponse(text, audio));
 
+                                    JSONObject result_json = new JSONObject();
+                                    result_json.put("rsp", g_cmd);
+                                    result_json.put("txid", g_txid);
+                                    result_json.put("status", STATUS_OK);
+                                    result_json.put("text", text);
+                                    queue.sendPacketStart(json2bin(result_json));
+                                } else {
+                                    JSONObject result_json = new JSONObject();
+                                    result_json.put("rsp", g_cmd);
+                                    result_json.put("txid", g_txid);
+                                    result_json.put("response", response);
+                                    queue.sendPacketStart(json2bin(result_json));
+                                }
+                            } catch (Exception ex) {
+                                Log.e(MainActivity.TAG, ex.getMessage());
+                            }
+                        }
+                    }).start();
+                    break;
+                }
+                case CMD_VIBRATOR: {
+                    int msec = (json.has("duration")) ? json.getInt("duration") : 500;
+                    vibrator.vibrate(VibrationEffect.createOneShot(msec, VibrationEffect.DEFAULT_AMPLITUDE));
+
+                    JSONObject result_json = new JSONObject();
+                    result_json.put("rsp", g_cmd);
+                    result_json.put("txid", g_txid);
+                    result_json.put("status", STATUS_OK);
+                    queue.sendPacketStart(json2bin(result_json));
+                    break;
+                }
+                default: {
+                    throw new Exception("Not supported cmd: " + g_cmd);
+                }
+            }
+        }catch(Exception ex){
+            Log.e(MainActivity.TAG, ex.getMessage());
+            try {
                 JSONObject result_json = new JSONObject();
                 result_json.put("rsp", g_cmd);
                 result_json.put("txid", g_txid);
-                result_json.put("status", STATUS_OK);
+                result_json.put("status", STATUS_ERROR);
                 queue.sendPacketStart(json2bin(result_json));
-                break;
-            }
-            default:{
-                Log.e(MainActivity.TAG, "Not supported cmd: " + g_cmd);
-                break;
+            } catch (Exception ex2) {
+                Log.e(MainActivity.TAG, ex2.getMessage());
             }
         }
     }
@@ -575,16 +709,6 @@ public class LocationService extends Service implements UIHandler.Callback {
                 Log.d(MainActivity.TAG,"progress on Done " + utteranceId);
                 if( audioManager != null )
                     audioManager.abandonAudioFocusRequest(mFocusRequest);
-
-                try {
-                    JSONObject result_json = new JSONObject();
-                    result_json.put("rsp", CMD_SPEECH);
-                    result_json.put("txid", g_txid);
-                    result_json.put("status", STATUS_OK);
-                    queue.sendPacketStart(json2bin(result_json));
-                }catch(Exception ex){
-                    Log.e(MainActivity.TAG, ex.getMessage());
-                }
             }
 
             @Override
@@ -592,16 +716,6 @@ public class LocationService extends Service implements UIHandler.Callback {
                 Log.d(MainActivity.TAG,"progress on Error " + utteranceId);
                 if( audioManager != null )
                     audioManager.abandonAudioFocusRequest(mFocusRequest);
-
-                try {
-                    JSONObject result_json = new JSONObject();
-                    result_json.put("rsp", CMD_SPEECH);
-                    result_json.put("txid", g_txid);
-                    result_json.put("status", STATUS_ERROR);
-                    queue.sendPacketStart(json2bin(result_json));
-                }catch(Exception ex){
-                    Log.e(MainActivity.TAG, ex.getMessage());
-                }
             }
         };
 
@@ -715,7 +829,7 @@ public class LocationService extends Service implements UIHandler.Callback {
             @Override
             public void onLocationChanged(Location location) {
                 Log.d(MainActivity.TAG, "onLocationChanged");
-                
+
                 LocationService.this.location = location;
             }
 
